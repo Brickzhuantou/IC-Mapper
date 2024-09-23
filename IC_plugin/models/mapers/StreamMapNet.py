@@ -79,7 +79,7 @@ class StreamMapNet(BaseMapper):
 
             self.register_buffer('plane', plane.double())
             
-            # 整体用字典维护，每个key代表一个类别；
+            # 0-ped 1-divder 2-boundary；
             self.map_vectors_memory = {
                 '0': StreamTensorMemory(
                     self.batch_size,
@@ -216,24 +216,6 @@ class StreamMapNet(BaseMapper):
             loss, log_vars, num_sample
         '''
         #  prepare labels and images
-        # for i in range(img.shape[0]):
-        #     divider_list = []
-        #     ped_list = []
-        #     boundary_list = []
-        #     for label, lines in vectors[i].items():                
-        #         for line in lines:
-        #             num_permute, num_points, coords_dim = line.shape
-        #             assert num_permute == 38
-        #             if label == 0:
-        #                 ped_list.append(line[0])
-        #             if label == 1:
-        #                 divider_list.append(line[0])
-        #             if label == 2:
-        #                 boundary_list.append(line[0])
-        #     import os
-        #     from StreamMap_plugin.data_process_test.vis_gt_test import plot_lines
-        #     filename = os.path.join('/home/zhh/zhujt/mmdet3d_1.0.0rc4_base/work_dirs/vis_online', f'{i}.png')
-        #     plot_lines(divider_list, ped_list, boundary_list, filename)
 
         gts, img, img_metas, valid_idx, points = self.batch_data(
             vectors, img, img_metas, img.device, points)
@@ -445,12 +427,8 @@ class StreamMapNet(BaseMapper):
         boundary_id_list = []
         
         buff_lines = self.update(img_metas)
-        # print('buff_lines:', buff_lines['ped_list'])
-        # print('len(ped): ', len(buff_lines['ped_list']))
-        # print('len(div): ', len(buff_lines['divider_list']))
-        # print('len(bd): ', len(buff_lines['boundary_list']))
-        # print('idx: ', idx)
-        # 获取上一帧的所有要素id
+
+        # get ids from memory
         temp = self.map_id_memory['0'].get(img_metas)
         ped_ids = temp['tensor'] # (num_prop, )
         temp = self.map_id_memory['1'].get(img_metas)
@@ -464,24 +442,6 @@ class StreamMapNet(BaseMapper):
             lines = []
             ids = []
             
-            # sub_divider_list = []
-            # sub_ped_list = []
-            # sub_boundary_list = []
-            
-            # for label, _lines in vectors[idx].items():
-            #     for _line in _lines:
-            #         labels.append(label)
-            #         if len(_line.shape) == 3: # permutation
-            #             num_permute, num_points, coords_dim = _line.shape
-            #             lines.append(torch.tensor(_line).reshape(num_permute, -1)) # (38, 40)
-            #         elif len(_line.shape) == 2:
-            #             lines.append(torch.tensor(_line).reshape(-1)) # (40, )
-            #         else:
-            #             assert False
-                        
-            # all_labels_list.append(torch.tensor(labels, dtype=torch.long).to(device))
-            # all_lines_list.append(torch.stack(lines).float().to(device))
-            
             sub_divider_list = []
             sub_ped_list = []
             sub_boundary_list = []
@@ -490,6 +450,7 @@ class StreamMapNet(BaseMapper):
             sub_ped_list2 = []
             sub_boundary_list2 = []
             
+            # get the current frame's vectors
             for label, _lines in vectors[idx].items():
                 for line in _lines:
                     num_permute, num_points, coords_dim = line.shape
@@ -521,23 +482,8 @@ class StreamMapNet(BaseMapper):
                             sub_boundary_list2.append(torch.tensor(line).reshape(-1)) # (40, )
                         else:
                             assert False
-                        
-                    # labels.append(label)
-                    # if len(line.shape) == 3: # permutation
-                    #     num_permute, num_points, coords_dim = line.shape
-                    #     lines.append(torch.tensor(line).reshape(num_permute, -1)) # (38, 40)
-                    # elif len(line.shape) == 2:
-                    #     lines.append(torch.tensor(line).reshape(-1)) # (40, )
-                    # else:
-                    #     assert False
-                        
-            # all_labels_list.append(torch.tensor(labels, dtype=torch.long).to(device))
-            # all_lines_list.append(torch.stack(lines).float().to(device))
             
-            # import pdb
-            # pdb.set_trace()
-            
-            
+            # get the vectors from the buffer
             if buff_lines['ped_list'] and buff_lines['ped_list'][idx]:
                 last_ped_tensor = torch.stack(buff_lines['ped_list'][idx]) # (num_prop, num_pts, 2)
                 last_ped_tensor = last_ped_tensor.view(last_ped_tensor.shape[0], -1) # (num_prop, num_pts*2)
@@ -563,6 +509,7 @@ class StreamMapNet(BaseMapper):
             last_boundary_scores = torch.zeros((last_boundary_tensor.shape[0], 3))
             last_boundary_scores[:, 2] = 1.0
             
+            # convert to tensor
             if sub_ped_list:
                 ped_list_tensor = [torch.from_numpy(line) for line in sub_ped_list]
                 cur_ped_tensor = torch.stack(ped_list_tensor)
@@ -593,78 +540,63 @@ class StreamMapNet(BaseMapper):
                 boundary_list.append(cur_boundary_tensor.to(device))
             cur_boundary_scores = (torch.ones((cur_boundary_tensor.shape[0], )) * 2).long()
             
+            # first frame：initialize id
             if is_first_frame_list[idx]:
-                # 序列第一帧所有新要素重新分配id；
                 cur_boundary_ids = torch.zeros((cur_boundary_tensor.shape[0], ))
                 for detection_idx in range(cur_boundary_tensor.shape[0]):
                     cur_boundary_ids[detection_idx] = self.cur_id
                     self.cur_id += 1
-                # self.map_id_memory['2'].update([cur_boundary_ids], img_metas)
                 
                 cur_divider_ids = torch.zeros((cur_divider_tensor.shape[0], ))
                 for detection_idx in range(cur_divider_tensor.shape[0]):
                     cur_divider_ids[detection_idx] = self.cur_id
                     self.cur_id += 1
-                # self.map_id_memory['1'].update([cur_divider_ids], img_metas)
                 
                 cur_ped_ids = torch.zeros((cur_ped_tensor.shape[0], ))
                 for detection_idx in range(cur_ped_tensor.shape[0]):
                     cur_ped_ids[detection_idx] = self.cur_id
                     self.cur_id += 1
-                # self.map_id_memory['0'].update([cur_ped_ids], img_metas)
             
             else:
-                # 针对boundary要素的匹配和id获取；======
+                # match to get id (boundary) ======
                 matches, unmatched_tracks, unmatched_detections = \
                         self.assigner.min_cost_matching(tracks=dict(lines=last_boundary_tensor.to(device), scores=last_boundary_scores.to(device),),
                                             detections=dict(lines=cur_boundary_tensor.to(device),labels=cur_boundary_scores.to(device), ))
-                # 新建一个存储id的tensor；
                 cur_boundary_ids = torch.zeros((cur_boundary_tensor.shape[0], ))
-                
-                # 匹配成功，将跟踪目标的id赋给当前帧的目标；
                 for track_idx, detection_idx in matches:
                     cur_boundary_ids[detection_idx] = boundary_ids[idx][track_idx]
-                # 没有匹配到的目标，新建一个id；
                 for detection_idx in unmatched_detections:
                     cur_boundary_ids[detection_idx] = self.cur_id
                     self.cur_id += 1
-                # 将当前帧的id存到缓存区中；
-                # self.map_id_memory['2'].update([cur_boundary_ids], img_metas)
-                
-                # 针对divider要素的匹配和id获取；======
+
+                # match to get id (divider) ======
                 matches, unmatched_tracks, unmatched_detections = \
                         self.assigner.min_cost_matching(tracks=dict(lines=last_divider_tensor.to(device), scores=last_divider_scores.to(device),),
                                             detections=dict(lines=cur_divider_tensor.to(device),labels=cur_divider_scores.to(device), ))
-                # 新建一个存储id的tensor；
                 cur_divider_ids = torch.zeros((cur_divider_tensor.shape[0], ))
                 for track_idx, detection_idx in matches:
                     cur_divider_ids[detection_idx] = divider_ids[idx][track_idx]
                 for detection_idx in unmatched_detections:
                     cur_divider_ids[detection_idx] = self.cur_id
                     self.cur_id += 1
-                # self.map_id_memory['1'].update([cur_divider_ids], img_metas)
-                
-                # 针对ped要素的匹配和id获取；======
+
+                # match to get id (ped) ======
                 matches, unmatched_tracks, unmatched_detections = \
                         self.assigner.min_cost_matching(tracks=dict(lines=last_ped_tensor.to(device), scores=last_ped_scores.to(device),),
                                             detections=dict(lines=cur_ped_tensor.to(device),labels=cur_ped_scores.to(device), ))
-                # 新建一个存储id的tensor；
                 cur_ped_ids = torch.zeros((cur_ped_tensor.shape[0], ))
                 for track_idx, detection_idx in matches:
                     cur_ped_ids[detection_idx] = ped_ids[idx][track_idx]
                 for detection_idx in unmatched_detections:
                     cur_ped_ids[detection_idx] = self.cur_id
                     self.cur_id += 1
-                # self.map_id_memory['0'].update([cur_ped_ids], img_metas)
             
             
             divider_id_list.append(cur_divider_ids)
             ped_id_list.append(cur_ped_ids)
             boundary_id_list.append(cur_boundary_ids)
             
-            # 统计得到labels和lines；
-            # all_labels_list.append(torch.tensor(labels, dtype=torch.long).to(device))
-            # all_lines_list.append(torch.stack(lines).float().to(device))
+            # get labels
             for i in range(len(sub_ped_list2)):
                 labels.append(0)
                 lines.append(sub_ped_list2[i])
@@ -687,12 +619,7 @@ class StreamMapNet(BaseMapper):
                 all_lines_list.append(torch.zeros((0, 38, 40)).to(device))
             all_ids_list.append(torch.tensor(ids, dtype=torch.long).to(device))
             
-            
-            
-        # 将当前帧的要素检测点集存到缓存区中；
-        # self.map_vectors_memory['0'].update([torch.tensor(ped_list)], img_metas)
-        # self.map_vectors_memory['1'].update([torch.tensor(divider_list)], img_metas)
-        # self.map_vectors_memory['2'].update([torch.tensor(boundary_list)], img_metas)  
+        # push to buffer
         self.map_vectors_memory['0'].update(ped_list, img_metas)
         self.map_vectors_memory['1'].update(divider_list, img_metas)
         self.map_vectors_memory['2'].update(boundary_list, img_metas)
@@ -705,7 +632,7 @@ class StreamMapNet(BaseMapper):
         gts = {
             'labels': all_labels_list,
             'lines': all_lines_list,
-            'ids': all_ids_list
+            'ids': all_ids_list # get id label
         }
         
         gts = [deepcopy(gts) for _ in range(self.num_decoder_layers)]
@@ -721,4 +648,3 @@ class StreamMapNet(BaseMapper):
         super().eval()
         if self.streaming_bev:
             self.bev_memory.eval()
-
