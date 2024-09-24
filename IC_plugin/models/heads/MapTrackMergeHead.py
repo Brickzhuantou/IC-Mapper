@@ -576,6 +576,130 @@ class MapTrackMergeHead(nn.Module):
             loss_dict['asso_batch_{}'.format(i)] = loss_single
         return loss_dict    
     
+    def get_layer_point_with_id_v2(self, patch_box, patch_angle, batch_idx):
+        patch_x = patch_box[0]
+        patch_y = patch_box[1]
+
+        patch = get_patch_coord(patch_box, patch_angle)
+        
+        history_map_points = {}
+        
+        remain_divider_dict = {}
+        for id, line in self.global_divider_map_register[batch_idx].items():
+            inter_line = line.intersection(patch)
+            if not inter_line.is_empty:
+                remain_line = line.difference(patch)             
+                if remain_line.is_empty:
+                    # TODO: remain为空就直接在inter_line上采样
+                    sample_points = sample_and_pad_linestring_v2(inter_line)
+                else:
+                    remain_divider_dict[id] = remain_line
+                    patch_extend = patch.buffer(20)
+                    inter_extend = line.intersection(patch_extend)
+                    sample_points = sample_and_pad_linestring_v2(inter_extend)
+                history_map_points[id] = sample_points
+            else:
+                remain_divider_dict[id] = line
+
+        remain_boundary_dict = {}
+        for id, line in self.global_boundary_map_register[batch_idx].items():
+            inter_line = line.intersection(patch)
+            if not inter_line.is_empty:
+                remain_line = line.difference(patch)
+                
+                if remain_line.is_empty:
+                    # TODO: remain为空就直接在inter_line上采样
+                    sample_points = sample_and_pad_linestring_v2(inter_line)
+                else:
+                    remain_boundary_dict[id] = remain_line
+                    patch_extend = patch.buffer(20)
+                    inter_extend = line.intersection(patch_extend)
+                    sample_points = sample_and_pad_linestring_v2(inter_extend)
+                history_map_points[id] = sample_points
+                
+            else:
+                remain_boundary_dict[id] = line
+        remain_ped_dict = {}
+        for id, polygon in self.global_ped_map_register[batch_idx].items():
+            inter_poly = polygon.intersection(patch)
+            if not inter_poly.is_empty: 
+                sample_points = sample_and_pad_linestring_v2(polygon.boundary) # 有交集就直接在整个polygon上进行采样；
+                
+                history_map_points[id] = sample_points
+                
+                remain_poly = polygon.difference(patch)
+                if not remain_poly.is_empty:
+                    remain_ped_dict[id] = remain_poly.boundary
+        return history_map_points, remain_divider_dict, remain_boundary_dict, remain_ped_dict
+                
+    
+    
+    def refine_and_decode(self, bev_feature, img_mask, hist_points_dict, query_embeddings, query_id_list, cur_ref_points, 
+                          track_query_embeddings, track_query_id_list, img_metas, ax):
+        if not hist_points_dict:
+            return None, None, None  # or handle accordingly
+        poly_id, poly_tensor = points_dict_to_tensors(hist_points_dict)
+        poly_id = poly_id.to(query_embeddings.device)
+        poly_tensor = poly_tensor.to(query_embeddings.device)
+        
+        curr_e2g_trans = query_embeddings.new_tensor(img_metas['ego2global_translation'], dtype=torch.float64)
+        curr_e2g_rot = query_embeddings.new_tensor(img_metas['ego2global_rotation'], dtype=torch.float64)
+        curr_g2e_matrix = torch.eye(4, dtype=torch.float64).to(query_embeddings.device)
+        
+        curr_g2e_matrix[:3, :3] = curr_e2g_rot.T
+        curr_g2e_matrix[:3, 3] = -(curr_e2g_rot.T @ curr_e2g_trans)
+        poly_tensor = torch.cat([
+            poly_tensor,
+            poly_tensor.new_zeros((poly_tensor.shape[0], self.num_points, 1)), # z-axis
+            poly_tensor.new_ones((poly_tensor.shape[0], self.num_points, 1)) # 4-th dim
+        ], dim=-1)
+        poly_tensor = torch.einsum('lk,ijk->ijl', curr_g2e_matrix, poly_tensor.double()).float()
+        poly_tensor = poly_tensor[:,:,:2]
+        
+        poly_emb_kv = self.polygon_encoder(poly_tensor) # 历史地图点集作为key和value； （num_inst，num_pts，embed_dims）
+
+        poly_refined_emb = []
+        poly_ref_points = []
+        poly_refined_ids = []
+        query_mask = []
+
+        for query_id, query_emb, quey_points in zip(query_id_list, query_embeddings, cur_ref_points):
+            if query_id in poly_id:
+                
+                if query_id in track_query_id_list:
+                    track_idx = (track_query_id_list == query_id).nonzero(as_tuple=True)[0]
+                    refined_emb = query_emb + track_query_embeddings[track_idx] # 生成增强的实例query编码
+                    
+                else:
+                    refined_emb = query_emb
+                poly_refined_emb.append(refined_emb)
+                poly_ref_points.append(quey_points)
+                poly_refined_ids.append(query_id)
+                query_mask.append(True)
+            else:
+                query_mask.append(False)
+
+        if len(poly_refined_emb) == 0:
+            return None, None, None
+        poly_refined_emb = torch.cat(poly_refined_emb, dim=0)
+        ref_points = torch.stack(poly_ref_points, dim=0)
+        
+        decoded_polygon_outputs = self.pointtransformer(
+            mlvl_feats=[bev_feature,],
+            mlvl_masks=[img_mask.type(torch.bool)],
+            hist_kv=poly_emb_kv,
+            query_points=ref_points,
+            mlvl_pos_embeds=[None], # not used
+            memory_query=None,
+            init_reference_points=ref_points,
+            predict_refine=self.predict_refine,
+            query_key_padding_mask=ref_points.new_zeros((ref_points.shape[0], ref_points.shape[1]), dtype=torch.bool), # mask used in self-attn,
+        )
+        
+        return decoded_polygon_outputs, torch.tensor(poly_refined_ids), query_mask
+        
+    
+    
     def refine_loss_calc(self, cur_querys, track_querys, cur_ids, track_ids, cur_ref_pts, gt_targets, is_first_frame_list, img_metas, bev_features, img_masks):
         '''
             refine loss after spatial fusion
@@ -842,7 +966,7 @@ class MapTrackMergeHead(nn.Module):
                     # line_points_dict, polygon_points_dict, remain_divider_dict, remain_boundary_dict, remain_ped_dict = self.get_layer_point_with_id(patch_box, yaw, i)
                     # hist_map_points, remain_divider_dict, remain_boundary_dict, remain_ped_dict = self.get_layer_point_with_id_v2(patch_box, yaw, i)
                                         
-                    # # TODO: 可视化
+                    # # DEBUG: 可视化
                     # self.vis_patch(hist_map_points, remain_boundary_dict, 
                     #                remain_divider_dict, remain_ped_dict, patch_box, yaw, self.ax_test, img_metas[i])
                     # plot_shape_lines(self.global_divider_map_register[i], self.global_boundary_map_register[i], self.global_ped_map_register[i], self.ax_test)
@@ -856,7 +980,7 @@ class MapTrackMergeHead(nn.Module):
                     # # 清空ax_test；
                     # self.fig_test, self.ax_test = plt.subplots()
                     
-                    # # TODO: 存储gt带方向的可视化图像；
+                    # # DONE: 存储gt带方向的可视化图像；
                     # self.vis_gt_patch(gt_targets_list[i],line_points_dict, polygon_points_dict, remain_boundary_dict, 
                     #                remain_divider_dict, remain_ped_dict, patch_box, yaw, self.ax_gt, img_metas[i])
                     
@@ -980,3 +1104,94 @@ def lane_merge4(remain_line, cur_line: torch.Tensor) -> LineString:
         for lane in remain_line:
             cur_line = single_lane_merge(lane, cur_line)
         return cur_line
+    
+def points_dict_to_tensors(data):
+    """
+    Convert a dictionary with int keys and list of shapely Point values to tensors.
+
+    Parameters:
+    - data: dict, where key is an int representing an ID, and value is a list of shapely Points.
+
+    Returns:
+    - ids_tensor: Tensor of shape (n,) containing the IDs.
+    - points_tensor: Tensor of shape (n, 20, 2) containing the points' coordinates.
+    """
+    # Initialize numpy array to store points
+    points_np = np.zeros((len(data), 20, 2))  # Assuming each ID has 20 points
+
+    # Fill the numpy array with coordinates from the shapely Points
+    for i, (id, points) in enumerate(data.items()):
+        for j, point in enumerate(points):
+            points_np[i, j] = [point.x, point.y]
+
+    # Convert IDs and points to tensors
+    ids_tensor = torch.tensor(list(data.keys()), dtype=torch.int32)
+    points_tensor = torch.tensor(points_np, dtype=torch.float32)
+
+    return ids_tensor, points_tensor
+
+
+def get_patch_coord(patch_box: Tuple[float, float, float, float],
+                patch_angle: float = 0.0) -> Polygon:
+    """
+    Convert patch_box to shapely Polygon coordinates.
+    :param patch_box: Patch box defined as [x_center, y_center, height, width].
+    :param patch_angle: Patch orientation in degrees.
+    :return: Box Polygon for patch_box.
+    """
+    patch_x, patch_y, patch_h, patch_w = patch_box
+
+    x_min = patch_x - patch_w / 2.0
+    y_min = patch_y - patch_h / 2.0
+    x_max = patch_x + patch_w / 2.0
+    y_max = patch_y + patch_h / 2.0
+
+    patch = box(x_min, y_min, x_max, y_max)
+    patch = affinity.rotate(patch, patch_angle, origin=(patch_x, patch_y), use_radians=False)
+
+    return patch
+
+
+def sample_and_pad_linestring_v2(lines, target_num_points=20):
+    if lines.type == 'LineString':
+        length = lines.length
+        if length == 0:
+            return []
+        # 计算间隔距离，注意要除以 num_points - 1，因为我们需要的是间隔的数量，不是点的数量
+        interval = length / (target_num_points - 1)
+        samples = []
+        
+        for i in range(target_num_points):
+            # 对于每个点，根据间隔距离和索引计算出在线上的具体位置
+            distance = interval * i
+            point = lines.interpolate(distance)
+            samples.append(point)
+        
+        return samples
+    elif lines.type == 'MultiLineString':
+        lengths = [line.length for line in lines]
+        total_length = sum(lengths)
+        if total_length == 0:
+            return []
+        sampled_points = []
+        
+        # 对每个LineString按其长度比例分配采样点数
+        for line in lines:
+            line_points = []
+            line_length = line.length
+            line_num_points = max(int(target_num_points * (line_length / total_length)), 1)  # 确保至少分配一个点
+            
+            interval = line_length / (line_num_points - 1 if line_num_points > 1 else 1)
+            current_dist = 0
+            
+            for _ in range(line_num_points):
+                if current_dist > line_length:
+                    break
+                point = line.interpolate(current_dist)
+                line_points.append(point)
+                current_dist += interval
+            
+            sampled_points.extend(line_points)
+        
+        return sampled_points[:target_num_points]  # 确保不超过总采样点数
+
