@@ -264,7 +264,7 @@ def main():
             if hasattr(datasets[0], 'PALETTE') else None)
     # add an attribute for visualization convenience
     # model.CLASSES = datasets[0].CLASSES
-    from StreamMap_plugin.core.apis import custom_train_model
+    from IC_plugin.core.apis import custom_train_model
     custom_train_model(
         model,
         datasets,

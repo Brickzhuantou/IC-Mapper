@@ -225,7 +225,7 @@ def main():
         dataset._evaluate(args.result_path)
         return
     
-    from StreamMap_plugin.datasets.builder import build_dataloader
+    from IC_plugin.datasets.builder import build_dataloader
 
     data_loader = build_dataloader(
             dataset,

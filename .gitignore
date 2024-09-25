@@ -1,0 +1,11 @@
+__pycache__/
+work_dirs/
+
+# softlinks
+av2
+nuScenes
+
+.vscode
+
+# datasets
+/datasets

@@ -7,7 +7,7 @@ type = 'Mapper'
 plugin = True
 
 # plugin code dir
-plugin_dir = 'StreamMap_plugin/'
+plugin_dir = 'IC_plugin/'
 
 # img configs
 img_norm_cfg = dict(
