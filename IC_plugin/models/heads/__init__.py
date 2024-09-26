@@ -1,10 +1,7 @@
 from .MapDetectorHead import MapDetectorHead
 from .MapTrackMergeHead import MapTrackMergeHead
 # from .MapTrackerHead import MapTrackerHead
-# from .MapTrackerHead_asso import MapTrackerAssoHead
-# from .MapMergeHead import MapMergeHead
-# from .MapMergeHead_v2 import MapMergeHeadv2
-# from .MapMergeHead_v3 import MapMergeHeadv3
-# from .MapMergeHead_v4 import MapMergeHeadv4
+from .MapTrackerHead_asso import MapTrackerAssoHead
+
 
 
