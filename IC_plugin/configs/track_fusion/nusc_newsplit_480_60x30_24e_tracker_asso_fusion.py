@@ -141,7 +141,7 @@ model = dict(
             ),
     ),
     head_cfg=dict(
-        type='MapMergeHeadv4',
+        type='MapTrackMergeHead',
         refine_all_layers=False,
         num_queries=num_queries,
         score_thr=0.1,
@@ -469,4 +469,4 @@ log_config = dict(
 
 SyncBN = True
 
-load_from = 'work_dirs/local_test/asso_base/iter_13920.pth'
+load_from = '.../iter_13920.pth' # the pretrained model path from stage1
