@@ -237,7 +237,7 @@ def main():
             nonshuffler_sampler=cfg.data.nonshuffler_sampler,  # dict(type='DistributedSampler'),
         )
     
-    from StreamMap_plugin.core.apis.test import custom_multi_gpu_test as multi_gpu_test
+    from IC_plugin.core.apis.test import custom_multi_gpu_test as multi_gpu_test
     # build the model and load checkpoint
     cfg.model.train_cfg = None
     model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'))

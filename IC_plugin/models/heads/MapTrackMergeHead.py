@@ -1237,8 +1237,273 @@ class MapTrackMergeHead(nn.Module):
 
 
     def forward_track_merge(self, bev_features, img_metas):
-        # TODO:
-        pass
+        # TODO: check
+        # pass
+        bev_features = self._prepare_context(bev_features)
+
+        bs, C, H, W = bev_features.shape
+        img_masks = bev_features.new_zeros((bs, H, W))
+        # pos_embed = self.positional_encoding(img_masks)
+        pos_embed = None
+
+        query_embedding = self.query_embedding.weight[None, ...].repeat(bs, 1, 1) # [B, num_q, embed_dims]
+        input_query_num = self.num_queries
+        # num query: self.num_query + self.topk
+        if self.streaming_query:
+            query_embedding, prop_query_embedding, init_reference_points, prop_ref_pts, memory_query, is_first_frame_list = \
+                self.propagate(query_embedding, img_metas, return_loss=False)
+            
+        else:
+            init_reference_points = self.reference_points_embed(query_embedding).sigmoid() # (bs, num_q, 2*num_pts)
+            init_reference_points = init_reference_points.view(-1, self.num_queries, self.num_points, 2) # (bs, num_q, num_pts, 2)
+            prop_query_embedding = None
+            prop_ref_pts = None
+            is_first_frame_list = [True for i in range(bs)]
+        
+        assert list(init_reference_points.shape) == [bs, input_query_num, self.num_points, 2]
+        assert list(query_embedding.shape) == [bs, input_query_num, self.embed_dims]
+
+        # outs_dec: (num_layers, num_qs, bs, embed_dims)
+        inter_queries, init_reference, inter_references = self.transformer(
+            mlvl_feats=[bev_features,],
+            mlvl_masks=[img_masks.type(torch.bool)],
+            query_embed=query_embedding,
+            prop_query=prop_query_embedding,
+            mlvl_pos_embeds=[pos_embed], # not used
+            memory_query=None,
+            init_reference_points=init_reference_points,
+            prop_reference_points=prop_ref_pts,
+            reg_branches=self.reg_branches,
+            cls_branches=self.cls_branches,
+            predict_refine=self.predict_refine,
+            is_first_frame_list=is_first_frame_list,
+            query_key_padding_mask=query_embedding.new_zeros((bs, self.num_queries), dtype=torch.bool), # mask used in self-attn,
+        )
+        
+        outputs = []
+        for i, (queries) in enumerate(inter_queries):
+            reg_points = inter_references[i] # (bs, num_q, num_points, 2)
+            bs = reg_points.shape[0]
+            reg_points = reg_points.view(bs, -1, 2*self.num_points) # (bs, num_q, 2*num_points)
+            scores = self.cls_branches[i](queries) # (bs, num_q, num_classes)
+
+            reg_points_list = []
+            scores_list = []
+            prop_mask_list = []
+            for i in range(len(scores)):
+                # padding queries should not be output
+                reg_points_list.append(reg_points[i])
+                scores_list.append(scores[i])
+                prop_mask = scores.new_ones((len(scores[i]), ), dtype=torch.bool)
+                prop_mask[-self.num_queries:] = False
+                prop_mask_list.append(prop_mask)
+
+            pred_dict = {
+                'lines': reg_points_list,
+                'scores': scores_list,
+                'prop_mask': prop_mask_list
+            }
+            outputs.append(pred_dict)
+        # DONE: Above are the detection part==============
+        if self.streaming_query:
+            # 获取上一帧的query编码,id,ref_points和active_mask;
+            last_track_emb, last_track_ref_pts, last_active_mask, is_first_frame_list = \
+                self.track_inst_propagate(query_embedding, img_metas)
+            last_track_ids = self.query_id_memory.get(img_metas)['tensor']
+            
+            query_list = []
+            ref_pts_list = []
+            topk_list = []
+            cur_query_ids = []
+            active_mask_list = []
+            lines, scores = outputs[-1]['lines'], outputs[-1]['scores']
+
+            for i in range(bs):
+                _lines = lines[i]
+                _queries = inter_queries[-1][i]
+                _scores = scores[i]
+                assert len(_lines) == len(_queries)
+                _scores, _ = _scores.max(-1)
+                topk_score, topk_idx = _scores.topk(k=self.topk_query, dim=-1)
+                topk_list.append(topk_idx)
+                # 当前的active mask
+                cur_active_mask = (_scores.sigmoid() > self.score_thr)
+                cur_ref_pts = inter_references[-1][i]
+                
+                # 计算det2track的矩阵
+                det2track_matrix_list = self.query_asso(_queries.unsqueeze(0), last_track_emb[i].unsqueeze(0), cur_ref_pts.unsqueeze(0), last_track_ref_pts[i].unsqueeze(0), last_active_mask[i].unsqueeze(0), cur_active_mask.unsqueeze(0), is_first_frame_list)
+
+                if is_first_frame_list[i]:
+                    self.cur_id = 0
+                    cur_query_id = torch.full((len(_queries),), -1).to(_queries.device)
+                    for idx in range(len(cur_query_id)):
+                        if cur_active_mask[idx]:
+                            cur_query_id[idx] = self.cur_id
+                            self.cur_id += 1
+                    cur_query_ids.append(cur_query_id)   
+                    
+                    # DONE: init the global map；
+                    self.global_ped_map_register[i] = {}
+                    self.global_boundary_map_register[i] = {}
+                    self.global_divider_map_register[i] = {}
+                    
+                    tmp_vectors = _lines
+                    num_preds, num_points2 = tmp_vectors.shape
+                    tmp_vectors = tmp_vectors.view(num_preds, num_points2//2, 2)
+                    tmp_vectors = tmp_vectors[cur_active_mask]
+                    tmp_scores, tmp_labels = scores[i].max(-1)
+                    tmp_scores = tmp_scores[cur_active_mask]
+                    tmp_labels = tmp_labels[cur_active_mask]
+                    tmp_ids = cur_query_id[cur_active_mask]
+                    
+                    divider_list = []
+                    divider_id_list = []
+                    ped_list = []
+                    ped_id_list = []
+                    boundary_list = []    
+                    boundary_id_list = []
+                    for j in range(len(tmp_vectors)):
+                        if tmp_labels[j] == 0:
+                            ped_list.append(tmp_vectors[j].detach().cpu().numpy())
+                            ped_id_list.append(tmp_ids[j])
+                        if tmp_labels[j] == 1:
+                            divider_list.append(tmp_vectors[j].detach().cpu().numpy())
+                            divider_id_list.append(tmp_ids[j])
+                        if tmp_labels[j] == 2:
+                            boundary_list.append(tmp_vectors[j].detach().cpu().numpy())
+                            boundary_id_list.append(tmp_ids[j])
+                    tmp = self.ego2global(ped_list, boundary_list, divider_list, img_metas[i])
+                    for idx in range(len(tmp['ped_list'])):
+                        cur_global_ped = tmp['ped_list'][idx]
+                        ped_geomery = Polygon(cur_global_ped[:,:2]).buffer(0)
+                        self.global_ped_map_register[i][ped_id_list[idx].item()] = ped_geomery
+                    for idx in range(len(tmp['bound_list'])):
+                        cur_global_bound = tmp['bound_list'][idx]
+                        bound_geomery = LineString(cur_global_bound[:,:2])
+                        self.global_boundary_map_register[i][boundary_id_list[idx].item()] = bound_geomery
+                    for idx in range(len(tmp['divider_list'])):
+                        cur_global_divider = tmp['divider_list'][idx]
+                        divider_geomery = LineString(cur_global_divider[:,:2])
+                        self.global_divider_map_register[i][divider_id_list[idx].item()] = divider_geomery
+
+                else:
+                    num_tracks = len(last_track_ids[i][last_active_mask[i]])  # 假设跟踪ID数量
+                    matched = torch.zeros(num_tracks, dtype=torch.bool).to(det2track_matrix_list[0].device)
+                    highest_scores = torch.full((num_tracks,), float('-inf')).to(det2track_matrix_list[0].device)  # 初始化为负无穷
+                    best_match_query_ids = torch.full((num_tracks,), -1, dtype=torch.long).to(det2track_matrix_list[0].device)  # 初始化匹配ID
+                    cur_query_id = torch.full((len(_queries),), -1).to(_queries.device)
+                    
+                    for idx in range(len(cur_query_id)):
+                        if cur_active_mask[idx]:
+                            indices = torch.nonzero(cur_active_mask, as_tuple=False).squeeze(1)
+                            idx2 = torch.nonzero(indices == idx, as_tuple=False).squeeze(1).item()
+                            matched_score = det2track_matrix_list[0][idx2]
+                            # find the max match score and idx
+                            if matched_score.numel() > 0:
+                                max_score, max_idx = matched_score.max(-1)
+                            else:
+                                max_score = -40
+                                max_idx = -1
+                            
+                            if max_score > -40 and not matched[max_idx]:
+                                if not matched[max_idx] or max_score > highest_scores[max_idx]:
+                                    if matched[max_idx] and max_score > highest_scores[max_idx]:
+                                        cur_query_id[best_match_query_ids[max_idx]] = self.cur_id
+                                        self.cur_id += 1
+                                    highest_scores[max_idx] = max_score
+                                    best_match_query_ids[max_idx] = idx
+                                    cur_query_id[idx] = last_track_ids[i][last_active_mask[i]][max_idx]
+                                    matched[max_idx] = True  # 标记为已匹配
+                            else:
+                                cur_query_id[idx] = self.cur_id
+                                self.cur_id += 1
+
+                    cur_query_ids.append(cur_query_id)
+                    # 获取patch更新地图 
+                    curr_e2g_trans = img_metas[i]['ego2global_translation']
+                    curr_e2g_rot = img_metas[i]['ego2global_rotation']
+                    patch_box = (curr_e2g_trans[0], curr_e2g_trans[1], 
+                        self.roi_size[1], self.roi_size[0]) # 根据当前的位姿坐标截取局部的patch
+                    rotation = Quaternion._from_matrix(np.array(curr_e2g_rot))
+                    yaw = quaternion_yaw(rotation) / np.pi * 180
+
+                    hist_map_points, remain_divider_dict, remain_boundary_dict, remain_ped_dict = self.get_layer_point_with_id_v2(patch_box, yaw, i)
+                    refined_polys, refined_poly_ids, query_poly_mask = self.refine_and_decode(bev_features[i], img_masks[i], hist_map_points, _queries, cur_query_id, cur_ref_pts, last_track_emb[i], last_track_ids[i], img_metas[i], self.ax_test)
+                    
+                    # DONE: update the det results
+                    if refined_polys != None:
+                        outputs[-1]['lines'][i][query_poly_mask] = refined_polys[-1].reshape(-1, 2*self.num_points)
+                    
+                    # DONE: update global map；
+                    tmp_vectors = _lines
+                    num_preds, num_points2 = tmp_vectors.shape
+                    tmp_vectors = tmp_vectors.view(num_preds, num_points2//2, 2)
+                    tmp_vectors = tmp_vectors[cur_active_mask]
+                    tmp_scores, tmp_labels = scores[i].max(-1)
+                    tmp_scores = tmp_scores[cur_active_mask]
+                    tmp_labels = tmp_labels[cur_active_mask]
+                    tmp_ids = cur_query_id[cur_active_mask]
+                    
+                    divider_list = []
+                    divider_id_list = []
+                    ped_list = []
+                    ped_id_list = []
+                    boundary_list = []    
+                    boundary_id_list = []
+                    for j in range(len(tmp_vectors)):
+                        if tmp_labels[j] == 0:
+                            ped_list.append(tmp_vectors[j].detach().cpu().numpy())
+                            ped_id_list.append(tmp_ids[j])
+                        if tmp_labels[j] == 1:
+                            divider_list.append(tmp_vectors[j].detach().cpu().numpy())
+                            divider_id_list.append(tmp_ids[j])
+                        if tmp_labels[j] == 2:
+                            boundary_list.append(tmp_vectors[j].detach().cpu().numpy())
+                            boundary_id_list.append(tmp_ids[j])
+                    tmp = self.ego2global(ped_list, boundary_list, divider_list, img_metas[i])
+                    tmp_ids = cur_query_id[cur_active_mask]
+
+                    for id_tensor in divider_id_list:
+                        indices = (torch.tensor(divider_id_list).to(id_tensor.device) == id_tensor).nonzero().squeeze(1)
+                        id = id_tensor.item()
+                        if id in remain_divider_dict:
+                            merge_lane = lane_merge4(remain_divider_dict[id], tmp['divider_list'][indices][:,:2])
+                            self.global_divider_map_register[i][id] = merge_lane
+                        else:
+                            lane_shapely = LineString(tmp['divider_list'][indices][:,:2])
+                            self.global_divider_map_register[i][id] = lane_shapely
+                    for id_tensor in boundary_id_list:
+                        indices = (torch.tensor(boundary_id_list).to(id_tensor.device) == id_tensor).nonzero().squeeze(1)
+                        id = id_tensor.item()
+                        if id in remain_boundary_dict:
+                            merge_boundary = lane_merge4(remain_boundary_dict[id], tmp['bound_list'][indices][:,:2])
+                            self.global_boundary_map_register[i][id] = merge_boundary
+                        else:
+                            boundary_shapely = LineString(tmp['bound_list'][indices][:,:2])
+                            self.global_boundary_map_register[i][id] = boundary_shapely
+                    for id_tensor in ped_id_list:
+                        indices = (torch.tensor(ped_id_list).to(id_tensor.device) == id_tensor).nonzero().squeeze(1)
+                        id = id_tensor.item()
+                        if id in self.global_ped_map_register[i]:
+                            merge_ped = self.global_ped_map_register[i][id].union(Polygon(tmp['ped_list'][indices][:,:2]).buffer(0))
+                            self.global_ped_map_register[i][id] = merge_ped
+                        else:
+                            ped_shapely = Polygon(tmp['ped_list'][indices][:,:2]).buffer(0)
+                            self.global_ped_map_register[i][id] = ped_shapely
+                
+                query_list.append(_queries)
+                ref_pts_list.append(_lines.view(-1, self.num_points, 2))
+                active_mask_list.append(cur_active_mask)
+
+            self.query_memory.update(query_list, img_metas)
+            self.query_id_memory.update(cur_query_ids, img_metas)
+            self.reference_points_memory.update(ref_pts_list, img_metas)
+            self.active_id_mask.update(active_mask_list, img_metas)
+            self.topk_mask.update(topk_list, img_metas)
+
+            outputs[-1]['ids'] = cur_query_ids
+
+        return outputs
 
 
 
