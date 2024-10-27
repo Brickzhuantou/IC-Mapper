@@ -16,3 +16,6 @@ ex:  bash tools/dist_test.sh ./IC_plugin/configs/track_fusion/nusc_newsplit_480_
 1. track metrics;
 2. mapping metrics;;
 
+# Visulization
+<video controls src="vis/output.mp4" title=""></video>
+
